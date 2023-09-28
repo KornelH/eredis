@@ -28,6 +28,7 @@
 
 -define(CONNECT_TIMEOUT, 5000).
 -define(RECONNECT_SLEEP, 100).
+-define(NOW_US, erlang:monotonic_time(microsecond)).
 
 %% API
 -export([start_link/1, stop/1]).
@@ -38,6 +39,7 @@
 
 %% Used by eredis_sub_client.erl
 -export([read_database/1, get_auth_command/2, connect/8, get_active/2]).
+
 
 -record(state, {
                 host            :: string() | {local, string()} | undefined,
@@ -55,7 +57,9 @@
                 socket          :: gen_tcp:socket() | ssl:sslsocket() | undefined,
                 reconnect_timer :: reference() | undefined,
                 parser_state    :: #pstate{} | undefined,
-                queue           :: eredis_queue() | undefined
+                queue           :: eredis_queue() | undefined,
+                stat_period_timer   :: reference() | undefined,
+                stat_subscribers    :: [pid()] | undefined
                }).
 
 %%
@@ -110,7 +114,10 @@ init(Options) ->
                    sentinel = Sentinel,
                    socket = undefined,
                    parser_state = eredis_parser:init(),
-                   queue = queue:new()},
+                   queue = queue:new(),
+                   stat_subscribers = []},
+
+    ets:new(eredis_client_stat, [set, protected, named_table]),
 
     case ReconnectSleep of
         no_reconnect ->
@@ -131,6 +138,21 @@ handle_call({pipeline, Pipeline}, From, State) ->
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
+
+handle_call({set_stat_period, TimeMs}, _From, State)
+  when TimeMs == 0;
+       10 < TimeMs, TimeMs < 86_400_000 ->
+    case State#state.stat_period_timer of
+        OldTRef when is_reference(OldTRef) -> erlang:cancel_timer(OldTRef);
+        _                                  -> ok
+    end,
+    NewState = reset_stat_period(State),
+    if  0 < TimeMs ->
+            {ok, TRef} = timer:send_interval(TimeMs, stat_period_tick),
+            {reply, ok, NewState#state{stat_period_timer = TRef}};
+        true ->
+            {reply, ok, NewState#state{stat_period_timer = undefined}}
+    end;
 
 handle_call(_Request, _From, State) ->
     {reply, unknown_request, State}.
@@ -242,6 +264,9 @@ handle_info(reconnect, State) ->
     %% Already connected.
     {noreply, State#state{reconnect_timer = undefined}};
 
+handle_info(stat_period_tick, State) ->
+    {noreply, reset_stat_period(State)};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -270,7 +295,8 @@ do_request(_Req, _From, #state{socket = undefined} = State) ->
 do_request(Req, From, #state{socket=Socket, transport=Transport}=State) ->
     case Transport:send(Socket, Req) of
         ok ->
-            NewQueue = queue:in({1, From}, State#state.queue),
+            ets:update_counter(eredis_client_stat, total_commands_in, 1),
+            NewQueue = queue:in({1, From, ?NOW_US}, State#state.queue),
             {noreply, State#state{queue = NewQueue}};
         {error, Reason} ->
             self() ! {send_error, Socket, Reason},
@@ -287,7 +313,9 @@ do_pipeline(_Pipeline, _From, #state{socket = undefined} = State) ->
 do_pipeline(Pipeline, From, #state{socket=Socket, transport=Transport}=State) ->
     case Transport:send(Socket, Pipeline) of
         ok ->
-            NewQueue = queue:in({length(Pipeline), From, []}, State#state.queue),
+            ets:update_counter(eredis_client_stat, total_commands_in, 1),
+            NewQueue = queue:in({length(Pipeline), From, ?NOW_US, []},
+                                State#state.queue),
             {noreply, State#state{queue = NewQueue}};
         {error, Reason} ->
             self() ! {send_error, Socket, Reason},
@@ -328,14 +356,16 @@ handle_response(Data, #state{parser_state = ParserState,
 %% wait for another reply from redis.
 reply(Value, Queue) ->
     case queue:out(Queue) of
-        {{value, {1, From}}, NewQueue} ->
+        {{value, {1, From, Timestamp}}, NewQueue} ->
+            update_stat(Timestamp),
             safe_reply(From, Value),
             NewQueue;
-        {{value, {1, From, Replies}}, NewQueue} ->
+        {{value, {1, From, Timestamp, Replies}}, NewQueue} ->
+            update_stat(Timestamp),
             safe_reply(From, lists:reverse([Value | Replies])),
             NewQueue;
-        {{value, {N, From, Replies}}, NewQueue} when N > 1 ->
-            queue:in_r({N - 1, From, [Value | Replies]}, NewQueue);
+        {{value, {N, From, Timestamp, Replies}}, NewQueue} when N > 1 ->
+            queue:in_r({N - 1, From, Timestamp, [Value | Replies]}, NewQueue);
         {empty, Queue} ->
             %% Oops
             ?LOG_NOTICE("eredis: Nothing in queue, but got value from parser"),
@@ -354,9 +384,9 @@ reply_all(Value, Queue) ->
             reply_all(Value, queue:drop(Queue))
     end.
 
-recipient({_, From}) ->
-    From;
 recipient({_, From, _}) ->
+    From;
+recipient({_, From, _, _}) ->
     From.
 
 safe_reply(undefined, _Value) ->
@@ -651,3 +681,34 @@ deobfuscate(String) when is_list(String); is_binary(String) ->
     String;
 deobfuscate(Fun) when is_function(Fun, 0) ->
     Fun().
+
+update_stat(Timestamp) ->
+    Latency = ?NOW_US - Timestamp,
+    ets:update_counter(eredis_client_stat, total_commands_out, 1),
+    ets:update_counter(eredis_client_stat, period_commands, 1),
+    case ets:lookup_element(eredis_client_stat, period_max_queue_time_us) of
+        MaxLatency when MaxLatency < Latency ->
+            ets:update_counter(eredis_client_stat, period_max_queue_time_us, Latency);
+        _ ->
+            ok
+    end,
+    ets:update_counter(eredis_client_stat, period_sum_queue_time_us, Latency).
+
+reset_stat_period(State = #state{stat_subscribers = StatSubscribers}) ->
+    Msg = {eredis_client_stat, maps:from_list(ets:tab2list(eredis_client_stat))},
+    NewStatSubscribers =
+        lists:filtermap(
+            fun(Pid) when is_pid(Pid) ->
+                try erlang:send(Pid, Msg), true
+                catch _:_ -> false
+                end;
+            (_) ->
+                false
+            end,
+            StatSubscribers),
+    ets:insert(eredis_client_stat,
+            [{period_commands, 0},
+             {period_max_queue_time_us, 0},
+             {period_sum_queue_time_us, 0}
+            ]),
+    State#state{stat_subscribers = NewStatSubscribers}.
