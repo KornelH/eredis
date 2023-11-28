@@ -16,6 +16,7 @@
          start_link/5, start_link/6, start_link/7]).
 -export([stop/1]).
 -export([q/2, q/3, qp/2, qp/3, q_noreply/2, q_async/2, q_async/3]).
+-export([get_stats/1, reset_stats/1, start_stats/2, stop_stats/1]).
 -export_type([options/0]).
 
 %% Exported for eredis_client, eredis_sub_client and testing
@@ -75,7 +76,15 @@ start_link() ->
 %% <dd> Sentinel Options: `{master_group, master_group_name}' - Atom, default: mymaster;
 %% `{endpoints, [{Host, Port}]}' - List of {Host, Port} tuples, default: [{"127.0.0.1", 26379}];
 %% `{username, Username}';`{password, Password}';`{connect_timeout, Timeout}';`{socket_options, SockOpts}'
-%% `{tls, TlsOpts}'</dd></dl>
+%% `{tls, TlsOpts}'</dd>
+%% <dt>`{stats, Type}'</dt>
+%%   <dd>Generate statistics. If `Type' is `simple' then only number of
+%%     commands, maximum and sum time is updated. If `Type' is `logarithmic'
+%%     then number of commands are updated based on the Log2 of the Redis
+%%     command turnaround time. If `Type' is `false' then no statistics is
+%%     maintained. Default is `false'.
+%%   </dd>
+%% </dl>
 -spec start_link(options()) -> {ok, pid()} | {error, Reason::term()}.
 start_link(Options) ->
     eredis_client:start_link(Options).
@@ -193,6 +202,18 @@ q_async(Client, Command) ->
 q_async(Client, Command, Pid) when is_pid(Pid) ->
     Request = {request, create_multibulk(Command), Pid},
     gen_server:cast(Client, Request).
+
+start_stats(Client, StatsType) ->
+    gen_server:cast(Client, {start_stats, StatsType}).
+
+stop_stats(Client) ->
+    gen_server:cast(Client, stop_stats).
+
+get_stats(Client) ->
+    gen_server:call(Client, get_stats).
+
+reset_stats(Client) ->
+    gen_server:call(Client, reset_stats).
 
 %%
 %% INTERNAL HELPERS

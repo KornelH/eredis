@@ -28,6 +28,7 @@
 
 -define(CONNECT_TIMEOUT, 5000).
 -define(RECONNECT_SLEEP, 100).
+-define(NOW_US, erlang:monotonic_time(microsecond)).
 
 %% API
 -export([start_link/1, stop/1]).
@@ -55,7 +56,9 @@
                 socket          :: gen_tcp:socket() | ssl:sslsocket() | undefined,
                 reconnect_timer :: reference() | undefined,
                 parser_state    :: #pstate{} | undefined,
-                queue           :: eredis_queue() | undefined
+                queue           :: eredis_queue() | undefined,
+                stats_type      :: simple | logarithmic | false | undefined,
+                stats           :: map() | undefined
                }).
 
 %%
@@ -93,6 +96,8 @@ init(Options) ->
     Transport      = transport_module(TlsOptions),
     Active         = get_active(SocketOptions, TlsOptions),
     Sentinel       = proplists:get_value(sentinel, Options, undefined),
+    StatsType      = proplists:get_value(stats, Options),
+    Stats          = new_stats(StatsType),
 
     %% We can handle {active, N} and {active, true}. Other modes crash here.
     true = is_integer(Active) orelse Active =:= true,
@@ -110,7 +115,9 @@ init(Options) ->
                    sentinel = Sentinel,
                    socket = undefined,
                    parser_state = eredis_parser:init(),
-                   queue = queue:new()},
+                   queue = queue:new(),
+                   stats_type = StatsType,
+                   stats = Stats},
 
     case ReconnectSleep of
         no_reconnect ->
@@ -132,6 +139,12 @@ handle_call({pipeline, Pipeline}, From, State) ->
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 
+handle_call(get_stats, _From, State = #state{stats = Stats}) ->
+    {reply, Stats, State};
+
+handle_call(reset_stats, _From, State = #state{stats = Stats}) ->
+    {reply, Stats, State#state{stats = reset_stats(Stats)}};
+
 handle_call(_Request, _From, State) ->
     {reply, unknown_request, State}.
 
@@ -152,6 +165,13 @@ handle_cast({request, Req, Pid}, State) ->
         {noreply, State1} ->
             {noreply, State1}
     end;
+
+handle_cast({start_stats, StatsType}, State = #state{}) ->
+    {noreply, State#state{stats_type = StatsType,
+                          stats = new_stats(StatsType)}};
+
+handle_cast(stop_stats, State = #state{}) ->
+    {noreply, State#state{stats = undefined}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -270,8 +290,9 @@ do_request(_Req, _From, #state{socket = undefined} = State) ->
 do_request(Req, From, #state{socket=Socket, transport=Transport}=State) ->
     case Transport:send(Socket, Req) of
         ok ->
-            NewQueue = queue:in({1, From}, State#state.queue),
-            {noreply, State#state{queue = NewQueue}};
+            NewQueue = queue:in({1, From, ?NOW_US}, State#state.queue),
+            NewStats = update_stats_at_request(State#state.stats),
+            {noreply, State#state{queue = NewQueue, stats = NewStats}};
         {error, Reason} ->
             self() ! {send_error, Socket, Reason},
             {reply, {error, Reason}, State}
@@ -287,8 +308,10 @@ do_pipeline(_Pipeline, _From, #state{socket = undefined} = State) ->
 do_pipeline(Pipeline, From, #state{socket=Socket, transport=Transport}=State) ->
     case Transport:send(Socket, Pipeline) of
         ok ->
-            NewQueue = queue:in({length(Pipeline), From, []}, State#state.queue),
-            {noreply, State#state{queue = NewQueue}};
+            NewQueue = queue:in({length(Pipeline), From, ?NOW_US, []},
+                                 State#state.queue),
+            NewStats = update_stats_at_request(State#state.stats),
+            {noreply, State#state{queue = NewQueue, stats = NewStats}};
         {error, Reason} ->
             self() ! {send_error, Socket, Reason},
             {reply, {error, Reason}, State}
@@ -299,21 +322,26 @@ do_pipeline(Pipeline, From, #state{socket=Socket, transport=Transport}=State) ->
 %% and replying to the correct client, handling partial responses,
 %% handling too much data and handling continuations.
 handle_response(Data, #state{parser_state = ParserState,
-                             queue = Queue} = State) ->
-
+                             queue = Queue,
+                             stats = Stats} = State) ->
+    RespTimestamp = ?NOW_US,
     case eredis_parser:parse(ParserState, Data) of
         %% Got complete response, return value to client
         {ReturnCode, Value, NewParserState} ->
-            NewQueue = reply({ReturnCode, Value}, Queue),
+            {NewQueue, NewStats} =
+                reply({ReturnCode, Value}, Queue, RespTimestamp, Stats),
             State#state{parser_state = NewParserState,
-                        queue = NewQueue};
+                        queue = NewQueue,
+                        stats = NewStats};
 
         %% Got complete response, with extra data, reply to client and
         %% recurse over the extra data
         {ReturnCode, Value, Rest, NewParserState} ->
-            NewQueue = reply({ReturnCode, Value}, Queue),
+            {NewQueue, NewStats} =
+                reply({ReturnCode, Value}, Queue, RespTimestamp, Stats),
             handle_response(Rest, State#state{parser_state = NewParserState,
-                                              queue = NewQueue});
+                                              queue = NewQueue,
+                                              stats = NewStats});
 
         %% Parser needs more data, the parser state now contains the
         %% continuation data and we will try calling parse again when
@@ -326,16 +354,21 @@ handle_response(Data, #state{parser_state = ParserState,
 %% queue without this client. If we are still waiting for parts of a
 %% pipelined request, push the reply to the the head of the queue and
 %% wait for another reply from redis.
-reply(Value, Queue) ->
+reply(Value, Queue, RespTimestamp, Stats) ->
     case queue:out(Queue) of
-        {{value, {1, From}}, NewQueue} ->
+        {{value, {1, From, Timestamp}}, NewQueue} ->
+            NewStats =
+                update_stats_at_response(RespTimestamp - Timestamp, Stats),
             safe_reply(From, Value),
-            NewQueue;
-        {{value, {1, From, Replies}}, NewQueue} ->
+            {NewQueue, NewStats};
+        {{value, {1, From, Timestamp, Replies}}, NewQueue} ->
+            NewStats =
+                update_stats_at_response(RespTimestamp - Timestamp, Stats),
             safe_reply(From, lists:reverse([Value | Replies])),
-            NewQueue;
-        {{value, {N, From, Replies}}, NewQueue} when N > 1 ->
-            queue:in_r({N - 1, From, [Value | Replies]}, NewQueue);
+            {NewQueue, NewStats};
+        {{value, {N, From, Timestamp, Replies}}, NewQueue} when N > 1 ->
+            {queue:in_r({N - 1, From, Timestamp, [Value | Replies]}, NewQueue),
+             Stats};
         {empty, Queue} ->
             %% Oops
             ?LOG_NOTICE("eredis: Nothing in queue, but got value from parser"),
@@ -354,9 +387,9 @@ reply_all(Value, Queue) ->
             reply_all(Value, queue:drop(Queue))
     end.
 
-recipient({_, From}) ->
+recipient({_N, From, _Timestamp}) ->
     From;
-recipient({_, From, _}) ->
+recipient({_N, From, _Timestamp, _Replies}) ->
     From.
 
 safe_reply(undefined, _Value) ->
@@ -651,3 +684,105 @@ deobfuscate(String) when is_list(String); is_binary(String) ->
     String;
 deobfuscate(Fun) when is_function(Fun, 0) ->
     Fun().
+
+%%%===================================================================
+%%%  Statistics
+%%%===================================================================
+
+new_stats(simple) ->
+    #{total_requests => 0,
+      total_responses => 0,
+      commands => 0,
+      max_time => 0,
+      sum_time => 0,
+      log_times => undefined};
+new_stats(logarithmic) ->
+    #{total_requests => 0,
+      total_responses => 0,
+      commands => 0,
+      max_time => 0,
+      sum_time => 0,
+      log_times => new_log_times()};
+new_stats(_StatsType) ->
+    undefined.
+
+new_log_times() ->
+    %% Magnitudes are chosen to be 0 and 2 to the power of 0..30 (1..1073741824)
+    %% to fit into a map of size 32. It covers the time scale from 0 to
+    %% 2147483647 microseconds (35.79 minutes). We assume that no Redis
+    %% operation takes more then 35 minutes.
+    #{16#00000000 => 0,
+      16#00000001 => 0, 16#00000002 => 0, 16#00000004 => 0, 16#00000008 => 0,
+      16#00000010 => 0, 16#00000020 => 0, 16#00000040 => 0, 16#00000080 => 0,
+      16#00000100 => 0, 16#00000200 => 0, 16#00000400 => 0, 16#00000800 => 0,
+      16#00001000 => 0, 16#00002000 => 0, 16#00004000 => 0, 16#00008000 => 0,
+      16#00010000 => 0, 16#00020000 => 0, 16#00040000 => 0, 16#00080000 => 0,
+      16#00100000 => 0, 16#00200000 => 0, 16#00400000 => 0, 16#00800000 => 0,
+      16#01000000 => 0, 16#02000000 => 0, 16#04000000 => 0, 16#08000000 => 0,
+      16#10000000 => 0, 16#20000000 => 0, 16#40000000 => 0  % no 2^31
+    }.
+
+update_stats_at_request(Stats = #{total_requests := TotReq}) ->
+    Stats#{total_requests => TotReq + 1};
+update_stats_at_request(Stats) ->
+    Stats.
+
+update_stats_at_response(Latency,
+                         Stats = #{total_responses := TotResp,
+                                   commands := C,
+                                   max_time := MT,
+                                   sum_time := ST,
+                                   log_times := LogTimes}) ->
+    Stats#{total_responses => TotResp + 1,
+           commands => C + 1,
+           max_time => erlang:max(MT, Latency),
+           sum_time => ST + Latency,
+           log_times => update_log_time(Latency, LogTimes)};
+update_stats_at_response(_Latency, Stats) ->
+    Stats.
+
+update_log_time(Latency, LogTimes = #{}) ->
+    %% As we assume that Latency is not more than 2^31-1 microseconds (~35.79
+    %% minutes), the highest bit of the Latency is maximum 2^31 that fits into
+    %% the log_times map created by {@link new_log_times/0}.
+    LatencyHighBit = high_bit32(Latency),
+    #{LatencyHighBit := N} = LogTimes,
+    LogTimes#{LatencyHighBit := N+1};
+update_log_time(_Latency, LogTimes) ->
+    LogTimes.
+
+reset_stats(Stats = #{log_times := #{}}) ->
+    Stats#{commands => 0,
+           max_time => 0,
+           sum_time => 0,
+           log_times => new_log_times()};
+reset_stats(Stats = #{}) ->
+    Stats#{commands => 0,
+           max_time => 0,
+           sum_time => 0,
+           log_times => undefined};
+reset_stats(Stats) ->
+    Stats.
+
+%%--------------------------------------------------------------------
+%% @doc Most significant (highest numbered) 1 bit of an unsigned integer.
+%%
+%% It is correct up to 32 bits unsigned integer.
+%% See more at [http://aggregate.org/MAGIC/#Most%20Significant%201%20Bit].
+%% @end
+%%--------------------------------------------------------------------
+%% Other references:
+%% https://stackoverflow.com/questions/671815/what-is-the-fastest-most-efficient-way-to-find-the-highest-set-bit-msb-in-an-i/672137#672137
+%% https://stackoverflow.com/questions/53161/find-the-highest-order-bit-in-c/53184#53184
+-spec high_bit32(non_neg_integer()) -> MostSignificantBit::non_neg_integer().
+high_bit32(N) when is_integer(N), 0 =< N ->
+    %% Fold the upper bits into the lower bits using SWAR algorithm
+    N1 = N bor (N bsr 1),
+    N2 = N1 bor (N1 bsr 2),
+    N4 = N2 bor (N2 bsr 4),
+    N8 = N4 bor (N4 bsr 8),
+    N16 = N8 bor (N8 bsr 16),
+    %% When N has only trailing ones (e.g. 0011) then all of these expressions
+    %% are the same: n - (n >> 1) == n ^ (n >> 1) == n & ~(n >> 1)
+    %% But n - (n >> 1) seems to be slightly faster on Linux and Intel.
+    N16 - (N16 bsr 1).

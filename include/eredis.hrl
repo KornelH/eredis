@@ -14,7 +14,8 @@
                   {socket_options, list()} |
                   {tls, [ssl:tls_client_option()]} |
                   {name, registered_name()} |
-                  {sentinel, list()}.
+                  {sentinel, list()} |
+                  {stats, simple | logarithmic | false}.
 
 -type options() :: [option()].
 -type server_args() :: options().               % for backwards compatibility
